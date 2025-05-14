@@ -7,6 +7,7 @@ from pylspclient.lsp_pydantic_strcuts import (
     TextDocumentIdentifier,
     TextDocumentItem,
     LanguageIdentifier,
+    Position,
 )
 
 from utils import *
@@ -15,7 +16,7 @@ from utils import *
 def parse_args():
     global args
     parser = argparse.ArgumentParser(description="LSP client for testing")
-    parser.add_argument("lang", type=str, choices=["c", "rust"])
+    parser.add_argument("lang", type=str, choices=["c", "rust", "python"])
     parser.add_argument("file", nargs="?", type=str)
     parser.add_argument("workspace", nargs="?", type=str)
     parser.add_argument("-w", "--wait", type=int, default=3)
@@ -29,6 +30,9 @@ def parse_args():
                 args.workspace = os.path.dirname(args.file)
             case "rust":
                 args.workspace = os.path.dirname(os.path.dirname(args.file))
+            case "python":
+                args.workspace = os.path.dirname(args.file)
+    return args
 
 
 def post_parse_args():
@@ -38,6 +42,10 @@ def post_parse_args():
         language_id = LanguageIdentifier.C
     elif args.lang == "rust":
         server_process_cmdlist = ["rust-analyzer"]
+        language_id = LanguageIdentifier.RUST
+    elif args.lang == "python":
+        server_process_cmdlist = ["pylsp"]
+        # server_process_cmdlist = ["jedi-language-server"]
         language_id = LanguageIdentifier.RUST
     else:
         raise ValueError("Invalid language argument")
@@ -88,14 +96,15 @@ def initialize_lsp():
     )
 
 
-def post_initialize():
+def post_initialize(semtokens=False):
     global token_types, token_modifiers
     ppprint("initialize_response", initresp)
-    token_legend = initresp["capabilities"]["semanticTokensProvider"]["legend"]
-    token_modifiers = token_legend["tokenModifiers"]
-    token_types = token_legend["tokenTypes"]
-    ppprint("token_types", token_types)
-    ppprint("token_modifiers", token_modifiers)
+    if semtokens:
+        token_legend = initresp["capabilities"]["semanticTokensProvider"]["legend"]
+        token_modifiers = token_legend["tokenModifiers"]
+        token_types = token_legend["tokenTypes"]
+        ppprint("token_types", token_types)
+        ppprint("token_modifiers", token_modifiers)
     client.initialized()
     time.sleep(args.wait)
 
@@ -106,16 +115,11 @@ def open_file():
     text = open(args.file, "r").read()
     textlines = text.splitlines()
     version = 1
-    print("didopen")
-
-    print(uri, language_id, version, text)
     client.didOpen(
         TextDocumentItem(uri=uri, languageId=language_id, version=version, text=text)
     )
-    print(uri)
-    print("ok didopen")
     textdoc = TextDocumentIdentifier(uri=uri).model_dump()
-    print("ok textdoc", textdoc)
+    assert textdoc is not None
 
 
 def do_semtokens():
@@ -128,6 +132,24 @@ def do_semtokens():
     print(annotate(text, annots))
 
 
+def do_typedefn(line, char):
+    print("do typedefn")
+    res = endpoint.call_method(
+        "textDocument/typeDefinition",
+        textDocument=textdoc,
+        position=Position(line=line, character=char),
+    )
+    # res = endpoint.call_method("textDocument/definition", textDocument=textdoc, position=Position(line=line, character=char))
+    pprint(res)
+
+
+def do_docsyms():
+    print("do docsyms")
+    res = endpoint.call_method("textDocument/documentSymbol", textDocument=textdoc)
+    # res = endpoint.call_method("textDocument/definition", textDocument=textdoc, position=Position(line=line, character=char))
+    pprint(res)
+
+
 def shutdown():
     client.shutdown()
     client.exit()
@@ -135,10 +157,17 @@ def shutdown():
     srvproc.communicate()
 
 
+semtokens = True
 parse_args()
 post_parse_args()
 initialize_lsp()
-post_initialize()
+post_initialize(semtokens)
 open_file()
-do_semtokens()
+do_docsyms()
+# if semtokens:
+#    do_semtokens()
+# else:
+#    #do_typedefn(31, 16) # IntPair
+#    #do_typedefn(38, 24) # CharVariant
+#    do_typedefn(29, 9) # list
 shutdown()
