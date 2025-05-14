@@ -2,6 +2,8 @@ import subprocess
 import time
 import argparse
 import os.path
+import logging
+from pprint import pformat
 
 import pylspclient
 from pylspclient.lsp_pydantic_strcuts import (
@@ -14,10 +16,19 @@ from pylspclient.lsp_pydantic_strcuts import (
 from utils import *
 
 
+file_handler = logging.FileHandler("lsp_notifications.log")
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+_notification_logger = logging.getLogger("LspNotification")
+_notification_logger.setLevel(logging.INFO)
+_notification_logger.addHandler(file_handler)
+
+
 def _log_notification(name):
     def f(*args, **kwargs):
-        print(f"{name}: args=", args)
-        print(f"{name}: kwargs=", kwargs)
+        _notification_logger.info(f"{name}: args={args}")
+        _notification_logger.info(f"{name}: kwargs={kwargs}")
 
     return f
 
@@ -79,13 +90,31 @@ class PyLspClient:
                 return None
 
     def __init__(
-        self, language_id=None, initfile=None, workspace=None, post_init_wait=1
+        self,
+        language_id=None,
+        initfile=None,
+        workspace=None,
+        post_init_wait=1,
+        lsp_timeout=2,
+        logfile="lsp.log",
     ):
         assert (initfile or workspace) is not None
         self.post_init_wait = post_init_wait
         self.language_id = language_id or self._infer_language_id(initfile, workspace)
         self.initfile = initfile
         self.workspace = workspace or self._infer_workspace(initfile)
+        self.lsp_timeout = lsp_timeout
+
+        file_handler = logging.FileHandler(logfile)
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        file_handler.setFormatter(formatter)
+
+        self.logger = logging.getLogger("PyLspClient")
+        self.logger.setLevel(logging.INFO)
+        self.logger.addHandler(file_handler)
 
     def shutdown(self):
         self.lspcli.shutdown()
@@ -127,6 +156,7 @@ class PyLspClient:
                     "publishDiagnostics"
                 ),
             },
+            timeout=self.lsp_timeout,
         )
         self.lspcli = pylspclient.LspClient(self.lsp_endpoint)
         # actually call initialize
@@ -147,7 +177,7 @@ class PyLspClient:
         )
 
     def post_initialize_lsp(self):
-        ppprint("initialize_response", self.init_response)
+        self.logger.info("initialize_response:\n" + pformat(self.init_response, 4))
         capabilities = self.init_response["capabilities"]
         if (
             "semanticTokensProvider" in capabilities
@@ -156,8 +186,8 @@ class PyLspClient:
             token_legend = capabilities["semanticTokensProvider"]["legend"]
             self.token_types = token_legend["tokenTypes"]
             self.token_modifiers = token_legend["tokenModifiers"]
-            ppprint("token_types", self.token_types)
-            ppprint("token_modifiers", self.token_modifiers)
+            self.logger.info("token_types:\n" + pformat(self.token_types, 4))
+            self.logger.info("token_modifiers:\n" + pformat(self.token_modifiers, 4))
         self.lspcli.initialized()
         time.sleep(self.post_init_wait)
 
@@ -168,7 +198,7 @@ class PyLspClient:
 
     def open_docfile(self, filepath):
         uri = to_uri(filepath)
-        with open(filepath, "r") as fin:
+        with open(to_path(filepath), "r") as fin:
             text = fin.read()
         version = 1
         self.lspcli.didOpen(
@@ -186,7 +216,8 @@ class PyLspClient:
         res = self.lsp_endpoint.call_method(
             "textDocument/documentSymbol", textDocument=doc
         )
-        pprint(res)
+        self.logger.debug("document_symbol:\n" + pformat(res, 4))
+        return res
 
     def semantic_tokens(self, filepath=None):
         filepath = filepath or self.initfile
@@ -199,6 +230,7 @@ class PyLspClient:
             tokens, self.token_types, self.token_modifiers, text.splitlines()
         )
         print(annotate(text, annots))
+        return res
 
     def type_definition(self, filepath=None, line=0, character=0):
         filepath = filepath or self.initfile
@@ -208,7 +240,8 @@ class PyLspClient:
             textDocument=doc,
             position=Position(line=line, character=character),
         )
-        pprint(res)
+        self.logger.debug("type_definition:\n" + pformat(res, 4))
+        return res
 
 
 cli = PyLspClient(
@@ -216,7 +249,8 @@ cli = PyLspClient(
 )
 cli.init()
 f = "/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/nddata/nddata_base.py"
+f = "/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/units/quantity.py"
 cli.document_symbol(f)
 cli.semantic_tokens(f)
-cli.type_definition(filepath=f, line=36, character=14)
+cli.type_definition(filepath=f, line=4, character=16)
 cli.shutdown()

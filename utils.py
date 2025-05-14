@@ -10,6 +10,13 @@ def to_uri(path: str, prefix="file://") -> str:
     return f"{prefix}{path}"
 
 
+def to_path(uri: str, prefix="file://") -> str:
+    if uri.startswith(prefix):
+        return uri[len(prefix) :]
+    assert uri.startswith("/")
+    return uri
+
+
 def ppprint(msg: str, obj):
     print(f"{msg}:")
     pprint(obj)
