@@ -1,6 +1,7 @@
 import subprocess
 import time
 import argparse
+import os.path
 
 import pylspclient
 from pylspclient.lsp_pydantic_strcuts import (
@@ -44,20 +45,27 @@ def parse_args():
 
 class PyLspClient:
     def _infer_language_id(self, initfile: str, workspace: str):
-        initfile_suffix = {
-            ".py": LanguageIdentifier.PYTHON,
-            ".rs": LanguageIdentifier.RUST,
-            ".c": LanguageIdentifier.C,
-            "Cargo.toml": LanguageIdentifier.RUST,
-        }
         if initfile is not None:
+            initfile_suffix = {
+                ".py": LanguageIdentifier.PYTHON,
+                ".rs": LanguageIdentifier.RUST,
+                ".c": LanguageIdentifier.C,
+            }
             for k, v in initfile_suffix.items():
                 if initfile.endswith(k):
+                    return v
+        if workspace is not None:
+            keyfiles = {
+                "Cargo.toml": LanguageIdentifier.RUST,
+                "setup.py": LanguageIdentifier.PYTHON,
+            }
+            for k, v in keyfiles.items():
+                keyfile = os.path.join(workspace, k)
+                if os.path.exists(keyfile):
                     return v
         return None
 
     def _infer_workspace(self, initfile: str):
-        print("_infer_workspace", initfile, self.language_id)
         if initfile is None:
             return None
         match self.language_id:
@@ -78,7 +86,6 @@ class PyLspClient:
         self.language_id = language_id or self._infer_language_id(initfile, workspace)
         self.initfile = initfile
         self.workspace = workspace or self._infer_workspace(initfile)
-        print("workspace", self.workspace)
 
     def shutdown(self):
         self.lspcli.shutdown()
@@ -98,12 +105,17 @@ class PyLspClient:
                 raise ValueError("Invalid language argument")
 
     def initialize_lsp(self):
-        self.srvproc = subprocess.Popen(
-            self.lsp_cmdlist,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            self.srvproc = subprocess.Popen(
+                self.lsp_cmdlist,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as e:
+            print(f"The language server {self.lsp_cmdlist} is not found")
+            print(f"Did you install it? Did you do `conda activate ...`?")
+            exit(1)
         self.json_rpc = pylspclient.JsonRpcEndpoint(
             self.srvproc.stdin, self.srvproc.stdout
         )
@@ -199,11 +211,12 @@ class PyLspClient:
         pprint(res)
 
 
-cli = PyLspClient(initfile="testdata/python/test.py")
-# cli = PyLspClient(initfile="/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/nddata/nddata_base.py")
-# cli = PyLspClient(initfile="testdata/rust/src/main.rs", post_init_wait=3)
+cli = PyLspClient(
+    workspace="/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy"
+)
 cli.init()
-cli.document_symbol()
-cli.semantic_tokens()
-cli.type_definition(line=36, character=14)
+f = "/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/nddata/nddata_base.py"
+cli.document_symbol(f)
+cli.semantic_tokens(f)
+cli.type_definition(filepath=f, line=36, character=14)
 cli.shutdown()
