@@ -1,24 +1,28 @@
+import logging
+import os.path
 import subprocess
 import time
-import argparse
-import os.path
-import logging
 from pprint import pformat
+from typing import Any, Optional
 
-import pylspclient
-from pylspclient.lsp_pydantic_strcuts import (
+import IPython
+import pylspclient  # type: ignore
+from pylspclient.lsp_pydantic_strcuts import (  # type: ignore
+    LanguageIdentifier,
     TextDocumentIdentifier,
     TextDocumentItem,
-    LanguageIdentifier,
-    Position,
 )
 
-from utils import *
+from utils import annotate, dump_semantic_tokens_full, readfile_whole, to_uri
 
-
-file_handler = logging.FileHandler("lsp_notifications.log")
-file_handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+os.makedirs("logs", exist_ok=True)
+CompatLogFormat: str = "%(asctime)s - %(levelname)s - %(message)s"
+VerboseLogFormat: str = (
+    "\n%(asctime)s - %(levelname)s - %(pathname)s:%(lineno)d in %(funcName)s\n%(message)s"
+)
+file_handler = logging.FileHandler("logs/lsp_notifications.log")
+file_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter(VerboseLogFormat)
 file_handler.setFormatter(formatter)
 _notification_logger = logging.getLogger("LspNotification")
 _notification_logger.setLevel(logging.INFO)
@@ -33,25 +37,7 @@ def _log_notification(name):
     return f
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="LSP client for testing")
-    parser.add_argument("lang", type=str, choices=["c", "rust", "python"])
-    parser.add_argument("file", nargs="?", type=str)
-    parser.add_argument("workspace", nargs="?", type=str)
-    parser.add_argument("-w", "--wait", type=int, default=3)
-    parser.add_argument(
-        "-r", "--raw", action="store_true", help="Dump semantic tokens as raw integers?"
-    )
-    args = parser.parse_args()
-    if args.workspace is None:
-        match args.lang:
-            case "c":
-                args.workspace = os.path.dirname(args.file)
-            case "rust":
-                args.workspace = os.path.dirname(os.path.dirname(args.file))
-            case "python":
-                args.workspace = os.path.dirname(args.file)
-    return args
+IntPair = tuple[int, int]
 
 
 class PyLspClient:
@@ -68,6 +54,7 @@ class PyLspClient:
         if workspace is not None:
             keyfiles = {
                 "Cargo.toml": LanguageIdentifier.RUST,
+                "rust-project.json": LanguageIdentifier.RUST,
                 "setup.py": LanguageIdentifier.PYTHON,
             }
             for k, v in keyfiles.items():
@@ -96,7 +83,9 @@ class PyLspClient:
         workspace=None,
         post_init_wait=1,
         lsp_timeout=2,
-        logfile="lsp.log",
+        logfile="logs/lsp.log",
+        verbose=False,
+        cacher: Optional[Any] = None,
     ):
         assert (initfile or workspace) is not None
         self.post_init_wait = post_init_wait
@@ -104,28 +93,35 @@ class PyLspClient:
         self.initfile = initfile
         self.workspace = workspace or self._infer_workspace(initfile)
         self.lsp_timeout = lsp_timeout
+        self.opened_docs: dict[str, TextDocumentIdentifier] = {}
+        self.cacher = cacher
 
         file_handler = logging.FileHandler(logfile)
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(VerboseLogFormat)
         file_handler.setFormatter(formatter)
 
         self.logger = logging.getLogger("PyLspClient")
-        self.logger.setLevel(logging.INFO)
+        log_level = logging.DEBUG if verbose else logging.INFO
+        self.logger.setLevel(log_level)
         self.logger.addHandler(file_handler)
 
     def shutdown(self):
         self.lspcli.shutdown()
         self.lspcli.exit()
         self.srvproc.kill()
-        self.srvproc.communicate()
+        stdout, stderr = self.srvproc.communicate()
+        if stdout:
+            print("Finish: LSP process stdout:\n", stdout.decode())
+        if stderr:
+            print("Finish: LSP process stderr:\n", stderr.decode())
 
     def compute_lspcmdlist(self):
         match self.language_id:
             case LanguageIdentifier.C:
-                self.lsp_cmdlist = ["clangd-18"]
+                self.lsp_cmdlist = [
+                    "clangd-18"
+                ]  # , "--compile-commands-dir=/home/zhenyang/O/data/Programs/bytedance/abcoder/testdata/cduplicate/build"]
             case LanguageIdentifier.RUST:
                 self.lsp_cmdlist = ["rust-analyzer"]
             case LanguageIdentifier.PYTHON:
@@ -191,37 +187,51 @@ class PyLspClient:
         self.lspcli.initialized()
         time.sleep(self.post_init_wait)
 
+    def get_toktype(self, t: int) -> str:
+        if not self.token_types:
+            return ""
+        if t < 0 or t >= len(self.token_types):
+            return f"UNKNOWN-TOKTYPE-{t}"
+        return self.token_types[t]
+
+    def get_tokmods(self, m: int) -> list[str]:
+        if not self.token_modifiers:
+            return []
+        return [
+            self.token_modifiers[i]
+            for i in range(len(self.token_modifiers))
+            if (m & (1 << i)) != 0
+        ]
+
     def init(self):
         self.compute_lspcmdlist()
         self.initialize_lsp()
         self.post_initialize_lsp()
 
-    def open_docfile(self, filepath):
+    def open_docfile(self, filepath: str) -> tuple[TextDocumentIdentifier, str]:
+        print(f"open_docfile {filepath=}")
+        if filepath in self.opened_docs:
+            return self.opened_docs[filepath], readfile_whole(filepath)
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(self.workspace, filepath)
         uri = to_uri(filepath)
-        with open(to_path(filepath), "r") as fin:
-            text = fin.read()
+        text = readfile_whole(filepath)
         version = 1
-        self.lspcli.didOpen(
-            TextDocumentItem(
-                uri=uri, languageId=self.language_id, version=version, text=text
-            )
+        doc1 = TextDocumentItem(
+            uri=uri, languageId=self.language_id, version=version, text=text
         )
+        self.lspcli.didOpen(doc1)
         doc = TextDocumentIdentifier(uri=uri).model_dump()
         assert doc is not None
+        self.opened_docs[filepath] = doc
         return doc, text
 
-    def document_symbol(self, filepath=None):
+    def semantic_tokens(self, filepath: Optional[str] = None) -> dict[str, Any]:
+        print("self.initfile", self.initfile)
         filepath = filepath or self.initfile
+        print(f"{filepath=}")
         doc, text = self.open_docfile(filepath)
-        res = self.lsp_endpoint.call_method(
-            "textDocument/documentSymbol", textDocument=doc
-        )
-        self.logger.debug("document_symbol:\n" + pformat(res, 4))
-        return res
-
-    def semantic_tokens(self, filepath=None):
-        filepath = filepath or self.initfile
-        doc, text = self.open_docfile(filepath)
+        print(f"{doc=}")
         res = self.lsp_endpoint.call_method(
             "textDocument/semanticTokens/full", textDocument=doc
         )
@@ -232,25 +242,153 @@ class PyLspClient:
         print(annotate(text, annots))
         return res
 
-    def type_definition(self, filepath=None, line=0, character=0):
+    def generic(self, method: str, **kwargs):
+        print(method, kwargs)
+        res = self.lsp_endpoint.call_method(f"{method}", **kwargs)
+        self.logger.debug(f"{method}:\n" + pformat(res, 4))
+        return res
+
+    def generic_notification(self, method: str, **kwargs):
+        print("notification ", method, kwargs)
+        res = self.lsp_endpoint.send_notification(f"{method}", **kwargs)
+        self.logger.debug(f"notification {method}:\n" + pformat(res, 4))
+        return res
+
+    def generic_textdoc(
+        self,
+        method: str,
+        filepath: Optional[str] = None,
+        pos: Optional[IntPair] = None,
+        range: Optional[tuple[IntPair, IntPair]] = None,
+    ):
+        key = f"{method=}:{filepath=}:{pos=}:{range=}"
+        if self.cacher and (cached := self.cacher.get(key)) is not None:
+            return cached
         filepath = filepath or self.initfile
-        doc, text = self.open_docfile(filepath)
+        doc, _ = self.open_docfile(filepath)
+        kwargs: dict[str, Any] = {}
+        if pos is not None:
+            kwargs["position"] = {"line": pos[0], "character": pos[1]}
+        if range is not None:
+            kwargs["range"] = {
+                "start": {"line": range[0][0], "character": range[0][1]},
+                "end": {"line": range[1][0], "character": range[1][1]},
+            }
         res = self.lsp_endpoint.call_method(
-            "textDocument/typeDefinition",
-            textDocument=doc,
-            position=Position(line=line, character=character),
+            f"textDocument/{method}", textDocument=doc, **kwargs
         )
-        self.logger.debug("type_definition:\n" + pformat(res, 4))
+        if self.cacher:
+            self.cacher.set(key, res)
+        self.logger.debug(f"{method}: RETURNED {type(res)}:\n" + pformat(res, 4))
         return res
 
 
-cli = PyLspClient(
-    workspace="/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy"
-)
-cli.init()
-f = "/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/nddata/nddata_base.py"
-f = "/home/zhenyang/O/data/Programs/bytedance/dataset-readable/astropy/astropy/units/quantity.py"
-cli.document_symbol(f)
-cli.semantic_tokens(f)
-cli.type_definition(filepath=f, line=4, character=16)
-cli.shutdown()
+def eval_inputkwargs(args: str) -> dict[str, Any]:
+    retval = {}
+    for arg in args.split(", "):
+        if not args.strip():
+            continue
+        if "=" not in arg:
+            raise ValueError(f"Invalid argument format: {arg}")
+        k, v = arg.split("=", 1)
+        if v[0].isnumeric():
+            v = int(v) if "." not in v else float(v)  # type: ignore
+        else:
+            v = ensure_unquoted(v.strip())
+        retval[k.strip()] = v.strip()
+    return retval
+
+
+def ensure_quoted(s: str) -> str:
+    if s[0] != '"' and s[-1] != '"':
+        return f'"{s}"'
+    return s
+
+
+def ensure_unquoted(s: str) -> str:
+    if s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def make_inputer(lines):
+    counter = 0
+    lines = lines.splitlines()
+
+    def f(prompt="", /):
+        nonlocal counter
+        counter += 1
+        if counter > len(lines):
+            raise EOFError()
+        res = lines[counter - 1]
+        print("-" * 78)
+        print(prompt, res)
+        return res
+
+    return f
+
+
+def main(inputer=input):
+    try:
+        while True:
+            init_kwargs = inputer("Input initkwargs, separated by ,")
+            init_kwargs = eval_inputkwargs(init_kwargs)
+            client = PyLspClient(lsp_timeout=5, **init_kwargs)
+            client.init()
+            persistent_kwargs = {}
+            while True:
+                print(f"persisted: {persistent_kwargs}")
+                print("Methods: q , set , semtoks , _")
+                cmdline = inputer("Method:args >> ")
+                if not cmdline.strip():
+                    continue
+                method, *args = cmdline.split(maxsplit=1)
+                temp_kwargs = eval_inputkwargs("".join(args))
+                try:
+                    match method:
+                        case "q":
+                            break
+                        case "set":
+                            persistent_kwargs.update(temp_kwargs)
+                            continue
+                        case "ckres":
+                            IPython.embed(header="See last result in `res`")
+                        case "reset":
+                            persistent_kwargs = {}
+                            continue
+                        case "semtoks":
+                            res = client.semantic_tokens(
+                                **(persistent_kwargs | temp_kwargs)
+                            )
+                            print(res)
+                        case _:
+                            method = method.strip()
+                            res = client.generic_textdoc(
+                                method, **(persistent_kwargs | temp_kwargs)
+                            )
+                except Exception as e:
+                    print(f"FAILED\n{e}")
+                else:
+                    print(f"OK\n{res}")
+    except EOFError:
+        print("Exiting...")
+        try:
+            client.shutdown()
+        except Exception as e:
+            pass
+        finally:
+            exit(0)
+
+
+demo_commands = """\
+workspace=testdata/python, initfile=test.py
+documentSymbol
+semtoks
+q"""
+
+if __name__ == "__main__":
+    is_demo = input("Demo? (y/n) ")
+    if is_demo:
+        main(make_inputer(demo_commands))
+    else:
+        main()

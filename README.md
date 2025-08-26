@@ -1,5 +1,7 @@
-# Introduction to LSP
-Requires
+# Demo on LSP
+You can also use it for debugging an LSP.
+
+requirements (must be in PATH):
 * C: clangd-18
 * Rust: rust-analyzer
 * Python: python-lsp-server
@@ -7,11 +9,8 @@ Requires
 
 Usage:
 ```sh
-python pylspcli.py c testdata/c/main.c
-python pylspcli.py rust testdata/rust/src/main.rs
-
-# The LSP Client as an object, useful for libraries
-python client_obj.py
+python client_obj.py # interactive use
+# for API use, read the code
 ```
 
 # Example results

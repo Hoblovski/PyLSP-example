@@ -1,1 +1,2 @@
-pylspclient==0.1.2
+IPython
+pylspclient
