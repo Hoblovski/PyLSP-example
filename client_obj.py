@@ -1,9 +1,14 @@
 import logging
 import os.path
 import subprocess
+import sys
 import time
-from pprint import pformat
+from pprint import pformat, pprint
+import traceback
 from typing import Any, Optional
+
+import threading
+from pylspclient.lsp_errors import ErrorCodes, ResponseError
 
 import IPython
 import pylspclient  # type: ignore
@@ -38,6 +43,20 @@ def _log_notification(name):
 
 
 IntPair = tuple[int, int]
+
+
+def flatten_symbols(symbols, parent_name=""):
+    """Flatten symbols from hierarchicalDocumentSymbolSupport"""
+    result = []
+    for sym in symbols:
+        qualified_name = f"{parent_name}.{sym['name']}" if parent_name else sym["name"]
+        new_sym = {**sym}
+        new_sym["name"] = qualified_name
+        new_sym.pop("children", None)
+        result.append(new_sym)
+        if sym.get("children"):
+            result.extend(flatten_symbols(sym["children"], qualified_name))
+    return result
 
 
 class PyLspClient:
@@ -125,7 +144,15 @@ class PyLspClient:
             case LanguageIdentifier.RUST:
                 self.lsp_cmdlist = ["rust-analyzer"]
             case LanguageIdentifier.PYTHON:
-                self.lsp_cmdlist = ["pylsp"]
+                # self.lsp_cmdlist = ["zuban", "server"]
+                self.lsp_cmdlist = [
+                    "jedi-language-server",
+                    "--log-file",
+                    "jedi.log",
+                    "-v",
+                ]
+                # self.lsp_cmdlist = ["./pygls"]
+                # self.lsp_cmdlist = ["pylsp"]
             case _:
                 raise ValueError("Invalid language argument")
 
@@ -147,6 +174,7 @@ class PyLspClient:
         self.lsp_endpoint = pylspclient.LspEndpoint(
             self.json_rpc,
             notify_callbacks={
+                "window/logMessage": _log_notification("windowLogMessage"),
                 "window/showMessage": _log_notification("windowShowMessage"),
                 "textDocument/publishDiagnostics": _log_notification(
                     "publishDiagnostics"
@@ -159,7 +187,13 @@ class PyLspClient:
         process_id, root_path = None, None
         root_uri = to_uri(self.workspace)
         initialization_options = None
-        capabilities = {}
+        capabilities = {
+            "textDocument": {
+                "documentSymbol": {
+                    "hierarchicalDocumentSymbolSupport": False,
+                }
+            }
+        }
         trace = "off"
         workspace_folders = None
         self.init_response = self.lspcli.initialize(
@@ -319,7 +353,7 @@ def make_inputer(lines):
         nonlocal counter
         counter += 1
         if counter > len(lines):
-            raise EOFError()
+            return input(prompt)
         res = lines[counter - 1]
         print("-" * 78)
         print(prompt, res)
@@ -333,7 +367,9 @@ def main(inputer=input):
         while True:
             init_kwargs = inputer("Input initkwargs, separated by ,")
             init_kwargs = eval_inputkwargs(init_kwargs)
-            client = PyLspClient(lsp_timeout=5, **init_kwargs)
+            if init_kwargs == {}:
+                raise EOFError()
+            client = PyLspClient(lsp_timeout=20, **init_kwargs)
             client.init()
             persistent_kwargs = {}
             while True:
@@ -351,8 +387,10 @@ def main(inputer=input):
                         case "set":
                             persistent_kwargs.update(temp_kwargs)
                             continue
-                        case "ckres":
-                            IPython.embed(header="See last result in `res`")
+                        case "ckres" | "ipy":
+                            IPython.embed(
+                                header="See last result in `res`, or operate with `client`"
+                            )
                         case "reset":
                             persistent_kwargs = {}
                             continue
@@ -370,25 +408,37 @@ def main(inputer=input):
                     print(f"FAILED\n{e}")
                 else:
                     print(f"OK\n{res}")
-    except EOFError:
+    except Exception as e:
+        if not isinstance(e, EOFError):
+            traceback.print_exc()
         print("Exiting...")
         try:
             client.shutdown()
         except Exception as e:
+            print("Shutdown had an exception...", file=sys.stderr)
             pass
         finally:
             exit(0)
 
 
-demo_commands = """\
-workspace=testdata/python, initfile=test.py
-documentSymbol
-semtoks
-q"""
-
-if __name__ == "__main__":
-    is_demo = input("Demo? (y/n) ")
-    if is_demo:
-        main(make_inputer(demo_commands))
-    else:
-        main()
+try:
+    client = PyLspClient(
+        lsp_timeout=20, workspace="testdata/python2", initfile="main.py"
+    )
+    client.init()
+    res = client.generic_textdoc("documentSymbol")
+    pprint(res)
+    print("*" * 78)
+    pprint(flatten_symbols(res))
+    print("*" * 78)
+    res = client.generic_textdoc("definition", pos=(0, 6))
+    print(res)
+    client.shutdown()
+except Exception as e:
+    print(f"WTF {e=}")
+    stdout, stderr = client.srvproc.communicate()
+    if stdout:
+        print("Finish: LSP process stdout:\n", stdout.decode())
+    if stderr:
+        print("Finish: LSP process stderr:\n", stderr.decode())
+    raise e
